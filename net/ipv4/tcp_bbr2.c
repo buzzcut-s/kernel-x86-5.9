@@ -2633,7 +2633,6 @@ static void bbr2_set_state(struct sock *sk, u8 new_state)
 		bbr_debug(sk, 0, &rs, &ctx);
 	} else if (bbr->prev_ca_state == TCP_CA_Loss &&
 		   new_state != TCP_CA_Loss) {
-		WARN_ON_ONCE(bbr->prior_cwnd == 0);
 		WARN_ON_ONCE(bbr->prior_cwnd == ~0U);
 		tp->snd_cwnd = max(tp->snd_cwnd, bbr->prior_cwnd);
 		bbr->try_fast_path = 0; /* bound cwnd using latest model */
