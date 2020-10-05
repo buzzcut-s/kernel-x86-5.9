@@ -16,4 +16,14 @@ config I2C_HID
 	  This support is also available as a module.  If so, the module
 	  will be called i2c-hid.
 
+if I2C_HID
+config I2C_HID_USE_BLOCK_READS
+	bool "Use block reads to save power"
+	default y
+	help
+	  Say Y here if you have an i2c controller with a driver that has
+	  proper I2C_M_RECV_LEN functionality and is not limited to the old
+	  SMBus standard of 32 bytes per block read.
+endif
+
 endmenu

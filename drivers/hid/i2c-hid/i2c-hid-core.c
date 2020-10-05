@@ -482,7 +482,11 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		size = ihid->bufsize;
 
 	/* Try to do a block read if the size fits in one byte */
-	flags = size > 255 ? I2C_M_RD : I2C_M_RD | I2C_M_RECV_LEN;
+	if (IS_ENABLED(CONFIG_I2C_HID_USE_BLOCK_READS) && size <= 255)
+		flags = I2C_M_RD | I2C_M_RECV_LEN;
+	else
+		flags = I2C_M_RD;
+
 	ret = i2c_transfer_buffer_flags(ihid->client, ihid->inbuf, size, flags);
 	if (ret != size) {
 		if (ret < 0)
