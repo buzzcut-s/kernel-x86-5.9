@@ -52,7 +52,7 @@
  */
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_irq_tp);
 
-#define ALT_SCHED_VERSION "v5.9-r0"
+#define ALT_SCHED_VERSION "v5.9-r1"
 
 /* rt_prio(prio) defined in include/linux/sched/rt.h */
 #define rt_task(p)		rt_prio((p)->prio)
@@ -92,7 +92,6 @@ static cpumask_t sched_rq_pending_mask ____cacheline_aligned_in_smp;
 
 DEFINE_PER_CPU(cpumask_t [NR_CPU_AFFINITY_CHK_LEVEL], sched_cpu_affinity_masks);
 DEFINE_PER_CPU(cpumask_t *, sched_cpu_affinity_end_mask);
-DEFINE_PER_CPU(cpumask_t *, sched_cpu_llc_mask);
 
 #ifdef CONFIG_SCHED_SMT
 DEFINE_STATIC_KEY_FALSE(sched_smt_present);
@@ -105,6 +104,59 @@ EXPORT_SYMBOL_GPL(sched_smt_present);
  * domain, see cpus_share_cache().
  */
 DEFINE_PER_CPU(int, sd_llc_id);
+
+enum {
+	LLC_LEVEL = 1,
+	NR_BEST_CPU_LEVEL
+};
+
+#define NR_BEST_CPU_MASK (1 << (NR_BEST_CPU_LEVEL - 1))
+
+static cpumask_t
+sched_best_cpu_masks[NR_CPUS][NR_BEST_CPU_MASK] ____cacheline_aligned_in_smp;
+
+#if NR_CPUS <= 64
+static inline unsigned int sched_cpumask_first_and(const struct cpumask *srcp,
+						   const struct cpumask *andp)
+{
+	unsigned long t = srcp->bits[0] & andp->bits[0];
+
+	if (t)
+		return __ffs(t);
+
+	return nr_cpu_ids;
+}
+
+static inline unsigned int sched_best_cpu(const unsigned int cpu,
+					  const struct cpumask *m)
+{
+	cpumask_t *chk = sched_best_cpu_masks[cpu];
+	unsigned long t;
+
+	while ((t = chk->bits[0] & m->bits[0]) == 0UL)
+		chk++;
+
+	return __ffs(t);
+}
+#else
+static inline unsigned int sched_cpumask_first_and(const struct cpumask *srcp,
+						   const struct cpumask *andp)
+{
+	return cpumask_first_and(srcp, andp);
+}
+
+static inline unsigned int sched_best_cpu(const unsigned int cpu,
+					  const struct cpumask *m)
+{
+	cpumask_t t, *chk = sched_best_cpu_masks[cpu];
+
+	while (!cpumask_and(&t, chk, m))
+		chk++;
+
+	return cpumask_any(t);
+}
+#endif
+
 #endif /* CONFIG_SMP */
 
 static DEFINE_MUTEX(sched_hotcpu_mutex);
@@ -800,7 +852,7 @@ int get_nohz_timer_target(void)
 		default_cpu = cpu;
 	}
 
-	for (mask = &(per_cpu(sched_cpu_affinity_masks, cpu)[0]);
+	for (mask = per_cpu(sched_cpu_affinity_masks, cpu);
 	     mask < per_cpu(sched_cpu_affinity_end_mask, cpu); mask++)
 		for_each_cpu_and(i, mask, housekeeping_cpumask(HK_FLAG_TIMER))
 			if (!idle_cpu(i))
@@ -1520,9 +1572,9 @@ static inline int select_task_rq(struct task_struct *p, struct rq *rq)
 	    cpumask_and(&tmp, &chk_mask, &sched_rq_watermark[IDLE_WM]) ||
 	    cpumask_and(&tmp, &chk_mask,
 			&sched_rq_watermark[task_sched_prio(p, rq) + 1]))
-		return best_mask_cpu(task_cpu(p), &tmp);
+		return sched_best_cpu(task_cpu(p), &tmp);
 
-	return best_mask_cpu(task_cpu(p), &chk_mask);
+	return sched_best_cpu(task_cpu(p), &chk_mask);
 }
 
 void sched_set_stop_task(int cpu, struct task_struct *stop)
@@ -3094,8 +3146,8 @@ static inline int active_load_balance_cpu_stop(void *data)
 {
 	struct rq *rq = this_rq();
 	struct task_struct *p = data;
-	cpumask_t tmp;
 	unsigned long flags;
+	int dcpu;
 
 	local_irq_save(flags);
 
@@ -3105,12 +3157,9 @@ static inline int active_load_balance_cpu_stop(void *data)
 	rq->active_balance = 0;
 	/* _something_ may have changed the task, double check again */
 	if (task_on_rq_queued(p) && task_rq(p) == rq &&
-	    cpumask_and(&tmp, p->cpus_ptr, &sched_sg_idle_mask)) {
-		int cpu = cpu_of(rq);
-		int dcpu = __best_mask_cpu(cpu, &tmp,
-					   per_cpu(sched_cpu_llc_mask, cpu));
+	    (dcpu = sched_cpumask_first_and(p->cpus_ptr, &sched_sg_idle_mask)) <
+	    nr_cpu_ids)
 		rq = move_queued_task(rq, p, dcpu);
-	}
 
 	raw_spin_unlock(&rq->lock);
 	raw_spin_unlock(&p->pi_lock);
@@ -3524,7 +3573,7 @@ static inline int take_other_rq_tasks(struct rq *rq, int cpu)
 	if (cpumask_empty(&sched_rq_pending_mask))
 		return 0;
 
-	affinity_mask = &(per_cpu(sched_cpu_affinity_masks, cpu)[0]);
+	affinity_mask = per_cpu(sched_cpu_affinity_masks, cpu);
 	end_mask = per_cpu(sched_cpu_affinity_end_mask, cpu);
 	do {
 		int i;
@@ -5872,11 +5921,13 @@ static void sched_init_topology_cpumask_early(void)
 			cpumask_copy(tmp, cpu_possible_mask);
 			cpumask_clear_cpu(cpu, tmp);
 		}
-		per_cpu(sched_cpu_llc_mask, cpu) =
-			&(per_cpu(sched_cpu_affinity_masks, cpu)[0]);
 		per_cpu(sched_cpu_affinity_end_mask, cpu) =
 			&(per_cpu(sched_cpu_affinity_masks, cpu)[1]);
 		/*per_cpu(sd_llc_id, cpu) = cpu;*/
+
+		for (level = 0; level < NR_BEST_CPU_MASK; level++)
+			cpumask_copy(&sched_best_cpu_masks[cpu][level],
+				     cpu_possible_mask);
 	}
 }
 
@@ -5903,7 +5954,6 @@ static void sched_init_topology_cpumask(void)
 		TOPOLOGY_CPUMASK(smt, topology_sibling_cpumask(cpu), false);
 #endif
 		per_cpu(sd_llc_id, cpu) = cpumask_first(cpu_coregroup_mask(cpu));
-		per_cpu(sched_cpu_llc_mask, cpu) = chk;
 		TOPOLOGY_CPUMASK(coregroup, cpu_coregroup_mask(cpu), false);
 
 		TOPOLOGY_CPUMASK(core, topology_core_cpumask(cpu), false);
@@ -5911,10 +5961,11 @@ static void sched_init_topology_cpumask(void)
 		TOPOLOGY_CPUMASK(others, cpu_online_mask, true);
 
 		per_cpu(sched_cpu_affinity_end_mask, cpu) = chk;
-		printk(KERN_INFO "sched: cpu#%02d llc_id = %d, llc_mask idx = %d\n",
-		       cpu, per_cpu(sd_llc_id, cpu),
-		       (int) (per_cpu(sched_cpu_llc_mask, cpu) -
-			      &(per_cpu(sched_cpu_affinity_masks, cpu)[0])));
+		printk(KERN_INFO "sched: cpu#%02d llc_id = %d\n",
+		       cpu, per_cpu(sd_llc_id, cpu));
+
+		cpumask_copy(sched_best_cpu_masks[cpu],
+			     cpu_coregroup_mask(cpu));
 	}
 }
 #endif
